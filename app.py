@@ -68,18 +68,60 @@ def translate_with_google(text: str) -> tuple[str, str]:
     except Exception:
         return text, "NOT FOUND"
 
+def extract_pairs_from_sheet(sheet):
+    """Scanează inteligent orice foaie pentru a găsi perechile Română -> Engleză"""
+    pairs = {}
+    if sheet.max_row is None or sheet.max_row < 1:
+        return pairs
+
+    # Identificăm coloana sursă și țintă
+    src_col, trg_col = 1, 2
+    header_found = False
+
+    for r in range(1, min(15, sheet.max_row + 1)):
+        row_vals = [normalize_text(str(sheet.cell(r, c).value or '')) for c in range(1, min(15, sheet.max_column + 1))]
+        for idx, val in enumerate(row_vals):
+            if any(k in val for k in ["ro", "sursa", "romana", "original", "source"]):
+                src_col = idx + 1
+                header_found = True
+            if any(k in val for k in ["en", "tinta", "engleza", "traducere", "target", "translation"]):
+                trg_col = idx + 1
+                header_found = True
+
+    start_row = 2 if header_found else 1
+
+    # Dacă sunt pe aceeași coloană din greșeală, punem coloanele implicite 1 și 2
+    if src_col == trg_col:
+        src_col, trg_col = 1, 2
+
+    for r in range(start_row, sheet.max_row + 1):
+        src = sheet.cell(r, src_col).value
+        trg = sheet.cell(r, trg_col).value
+
+        # Dacă coloana detectată e goală, căutăm primele două celule populate din rând
+        if not src or not trg:
+            non_empty = [c for c in range(1, min(10, sheet.max_column + 1)) if sheet.cell(r, c).value not in [None, ""]]
+            if len(non_empty) >= 2:
+                src = sheet.cell(r, non_empty[0]).value
+                trg = sheet.cell(r, non_empty[1]).value
+
+        if src and trg:
+            src_str = str(src).strip()
+            trg_str = str(trg).strip()
+            if src_str and trg_str and not is_purely_numeric(src_str):
+                pairs[normalize_text(src_str)] = trg_str
+
+    return pairs
+
 def load_master_dictionary():
     dictionary = {}
     if os.path.exists(DEFAULT_DICT_PATH):
         try:
-            dict_wb = load_workbook(DEFAULT_DICT_PATH)
-            for s in dict_wb.sheetnames:
-                sheet = dict_wb[s]
-                for r in range(1, sheet.max_row + 1):
-                    src = sheet.cell(r, 1).value
-                    trg = sheet.cell(r, 2).value
-                    if src and trg:
-                        dictionary[normalize_text(str(src))] = str(trg).strip()
+            dict_wb = load_workbook(DEFAULT_DICT_PATH, data_only=True)
+            for sheet_name in dict_wb.sheetnames:
+                sheet = dict_wb[sheet_name]
+                extracted = extract_pairs_from_sheet(sheet)
+                dictionary.update(extracted)
         except Exception:
             pass
     return dictionary
@@ -89,14 +131,13 @@ def run_translation_pipeline(input_bytes, master_dict):
     wb_vals = load_workbook(io.BytesIO(input_bytes), data_only=True)
 
     dictionary = dict(master_dict)
+    
+    # Verificăm dacă există și un dicționar integrat în fișierul de tradus
     for s in wb.sheetnames:
         if normalize_text(s) in ["dictionar", "dictionary", "glosar"]:
             sheet = wb[s]
-            for r in range(1, sheet.max_row + 1):
-                src = sheet.cell(r, 1).value
-                trg = sheet.cell(r, 2).value
-                if src and trg:
-                    dictionary[normalize_text(str(src))] = str(trg).strip()
+            extracted = extract_pairs_from_sheet(sheet)
+            dictionary.update(extracted)
 
     out_wb = Workbook()
     out_wb.remove(out_wb.active)
@@ -199,9 +240,9 @@ st.title("📊 Excel Mirror Translator (Dicționar Încorporat)")
 
 master_dict = load_master_dictionary()
 if master_dict:
-    st.success(f"Dicționarul de bază este încărcat automat ({len(master_dict)} termeni disponibili).")
+    st.success(f"Dicționarul de bază este încărcat automat ({len(master_dict)} termeni unici disponibili).")
 else:
-    st.warning("Fișierul `dictionar.xlsx` nu a fost găsit în repository. Adaugă-l pe GitHub pentru a activa dicționarul permanent.")
+    st.warning("Fișierul `dictionar.xlsx` nu a fost găsit în repository.")
 
 uploaded_file = st.file_uploader("Încarcă fișierul Excel de Tradus (.xlsx)", type=["xlsx"])
 
@@ -289,16 +330,13 @@ if st.session_state.translated_wb is not None:
     with col_dl2:
         if not edited_df.empty:
             if st.button("Generează Dicționarul Actualizat"):
-                # Creăm dicționarul master combinat
                 updated_wb = Workbook()
                 ws = updated_wb.active
                 ws.title = "Dictionar"
                 
-                # Punem termenii vechi
                 for k, v in master_dict.items():
                     ws.append([k, v])
                 
-                # Adăugăm termenii noi validați
                 for _, row in edited_df.iterrows():
                     if row["Validează"]:
                         ws.append([row["Termen Română"], row["Traducere Engleză (Editabil)"]])
