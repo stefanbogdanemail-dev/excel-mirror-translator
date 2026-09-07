@@ -1,13 +1,15 @@
 import os
 import io
 import re
+import copy
+import base64
 import unicodedata
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side
 from deep_translator import GoogleTranslator
-import copy
+from github import Github
 
 st.set_page_config(page_title="Excel Mirror Translator", page_icon="📊", layout="wide")
 
@@ -112,8 +114,42 @@ def load_master_dictionary():
             pass
     return dictionary
 
+def update_github_dictionary(new_approved_pairs: dict):
+    token = st.secrets.get("GITHUB_TOKEN")
+    repo_name = st.secrets.get("GITHUB_REPO", "stefanbogdanemail-dev/excel-mirror-translator")
+    
+    if not token:
+        st.warning("GITHUB_TOKEN nu este setat în Secrets. Termenii nu au putut fi sincronizați automat pe GitHub.")
+        return False
+
+    try:
+        g = Github(token)
+        repo = g.get_repo(repo_name)
+        contents = repo.get_contents(DEFAULT_DICT_PATH)
+        file_bytes = base64.b64decode(contents.content)
+        
+        dict_wb = load_workbook(io.BytesIO(file_bytes))
+        sheet = dict_wb.active
+
+        for src, trg in new_approved_pairs.items():
+            sheet.append([src, trg])
+
+        out_buf = io.BytesIO()
+        dict_wb.save(out_buf)
+        out_buf.seek(0)
+
+        repo.update_file(
+            path=DEFAULT_DICT_PATH,
+            message="Auto-update dictionar din aplicatia Streamlit (termeni aprobati)",
+            content=out_buf.getvalue(),
+            sha=contents.sha
+        )
+        return True
+    except Exception as e:
+        st.error(f"Eroare la actualizarea pe GitHub: {e}")
+        return False
+
 def run_translation_pipeline(input_bytes, master_dict):
-    # Încărcăm fișierul original - pe el vom lucra direct pentru a păstra absolut toată formatarea
     wb = load_workbook(io.BytesIO(input_bytes), data_only=False)
     wb_vals = load_workbook(io.BytesIO(input_bytes), data_only=True)
 
@@ -126,28 +162,22 @@ def run_translation_pipeline(input_bytes, master_dict):
     stats = {"MATCH": 0, "MISSING": 0, "NOT FOUND": 0, "SKIP": 0}
     unique_new_terms = {}
 
-    source_sheets = [s for s in wb.sheetnames]
-
-    for sheet_name in source_sheets:
+    for sheet_name in wb.sheetnames:
         src_sheet = wb[sheet_name]
         val_sheet = wb_vals[sheet_name]
         s_norm = normalize_text(sheet_name)
 
-        # Ignorăm dicționarele și foile deja traduse (marcate cu _)
         if s_norm in ["dictionar", "dictionary", "glosar"] or sheet_name.startswith('_'):
             continue
 
-        # 1. Clonare Nativă a Foii - Păstrează 100% formatarea, inclusiv zone de print, freeze panes etc.
         tr_twin = wb.copy_worksheet(src_sheet)
         tr_title = f"{sheet_name[:25]} (EN)"[:31]
         tr_twin.title = tr_title
 
-        # Mutăm foaia geamănă imediat după foaia originală
         target_idx = wb.index(src_sheet) + 1
         current_idx = wb.index(tr_twin)
         wb.move_sheet(tr_twin, offset=target_idx - current_idx)
 
-        # Calculăm care celule fac parte din "merged ranges" dar nu sunt celula principală
         merged_non_anchors = set()
         for rng in tr_twin.merged_cells.ranges:
             for r in range(rng.min_row, rng.max_row + 1):
@@ -155,7 +185,6 @@ def run_translation_pipeline(input_bytes, master_dict):
                     if not (r == rng.min_row and c == rng.min_col):
                         merged_non_anchors.add((r, c))
 
-        # 2. Traducerea valorilor în foaia clonată
         for r in range(1, tr_twin.max_row + 1):
             for c in range(1, tr_twin.max_column + 1):
                 if (r, c) in merged_non_anchors:
@@ -165,7 +194,6 @@ def run_translation_pipeline(input_bytes, master_dict):
                 dst_c = tr_twin.cell(r, c)
                 val = val_sheet.cell(r, c).value
                 
-                # Dacă e o formulă, copiem valoarea calculată în locul formulei (ca să nu dea eroare în engleză)
                 if dst_c.data_type == 'f':
                     dst_c.value = val
 
@@ -176,7 +204,6 @@ def run_translation_pipeline(input_bytes, master_dict):
                 val_str = str(val).strip()
                 val_norm = normalize_text(val_str)
 
-                # Prioritate Dicționar
                 if val_norm in dictionary:
                     dst_c.value = dictionary[val_norm]
                     stats["MATCH"] += 1
@@ -193,7 +220,6 @@ def run_translation_pipeline(input_bytes, master_dict):
                         dst_c.border = BORDER_NOT_FOUND
                         review_rows.append((tr_title, r, c, val_str, tr_text, "NOT FOUND"))
 
-    # Tab _Review Summary
     summary = wb.create_sheet(title="_Review Summary", index=0)
     summary.append(["Sheet", "Row", "Column", "Original", "Translation", "Status"])
     for col_idx in range(1, 7):
@@ -210,13 +236,13 @@ def run_translation_pipeline(input_bytes, master_dict):
     return wb, stats, unique_new_terms
 
 # --- UI Streamlit ---
-st.title("📊 Excel Mirror Translator (Dicționar Încorporat)")
+st.title("📊 Excel Mirror Translator (Auto-Sync Dicționar)")
 
 master_dict = load_master_dictionary()
 if master_dict:
-    st.success(f"Dicționarul de bază este încărcat automat ({len(master_dict)} termeni unici disponibili).")
+    st.success(f"Dicționarul master este activ ({len(master_dict)} termeni unici).")
 else:
-    st.warning("Fișierul `dictionar.xlsx` nu a fost găsit în repository.")
+    st.warning("Fișierul `dictionar.xlsx` nu a fost găsit.")
 
 uploaded_file = st.file_uploader("Încarcă fișierul Excel de Tradus (.xlsx)", type=["xlsx"])
 
@@ -247,81 +273,44 @@ if st.session_state.translated_wb is not None:
     stats = st.session_state.stats
     st.success(f"Statistici: Dicționar (MATCH): {stats['MATCH']} | Google Translate (MISSING): {stats['MISSING']} | Netraduse (NOT FOUND): {stats['NOT FOUND']}")
 
-    st.markdown("### 📝 Pasul 2: Revizuiește termenii noi")
+    st.markdown("### 📝 Pasul 2: Revizuire & Salvare Directă în Dicționar")
 
     if not st.session_state.new_terms_df.empty:
         edited_df = st.data_editor(
             st.session_state.new_terms_df,
             column_config={
-                "Validează": st.column_config.CheckboxColumn("Salvează?", default=True),
+                "Validează": st.column_config.CheckboxColumn("Aprobă pentru dicționar?", default=True),
                 "Termen Română": st.column_config.TextColumn("Termen Română", disabled=True),
-                "Traducere Engleză (Editabil)": st.column_config.TextColumn("Traducere Engleză (Editează)")
+                "Traducere Engleză (Editabil)": st.column_config.TextColumn("Traducere Engleză (Editează dacă e cazul)")
             },
             hide_index=True,
             use_container_width=True
         )
     else:
-        st.write("Toți termenii au fost găsiți în dicționar.")
+        st.write("Toți termenii au existat deja în dicționar.")
         edited_df = pd.DataFrame()
 
-    st.markdown("### 💾 Pasul 3: Descarcă fișierele")
+    st.markdown("### 💾 Pasul 3: Salvează în Dicționar și Descarcă Excelul Tradus")
     
-    col_dl1, col_dl2 = st.columns(2)
-
-    with col_dl1:
-        if st.button("Generează Fișierul Tradus"):
-            out_wb = copy.copy(st.session_state.translated_wb)
-
-            if not edited_df.empty:
-                dict_sheet = None
-                for s in out_wb.sheetnames:
-                    if normalize_text(s) in ["dictionar", "dictionary", "glosar"]:
-                        dict_sheet = out_wb[s]
-                        break
-                if not dict_sheet:
-                    dict_sheet = out_wb.create_sheet(title="Dictionar")
-                    dict_sheet.append(["TERMEN SURSA", "TRADUCERE", "STATUS"])
-
-                dict_sheet.append([])
-                h = dict_sheet.cell(dict_sheet.max_row + 1, 1, "TERMENI NOI - CONFIRMATI")
-                h.font = Font(bold=True, italic=True)
-
-                for _, row in edited_df.iterrows():
-                    if row["Validează"]:
-                        dict_sheet.append([row["Termen Română"], row["Traducere Engleză (Editabil)"], "Confirmat"])
-
-            buf = io.BytesIO()
-            out_wb.save(buf)
-            buf.seek(0)
-
-            st.download_button(
-                label="📥 Descarcă Excel Tradus (.xlsx)",
-                data=buf,
-                file_name=f"translated_{uploaded_file.name}",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-    with col_dl2:
+    if st.button("✅ Confirmă Termenii și Pregătește Descărcarea"):
         if not edited_df.empty:
-            if st.button("Generează Dicționarul Actualizat"):
-                updated_wb = Workbook()
-                ws = updated_wb.active
-                ws.title = "Dictionar"
-                
-                for k, v in master_dict.items():
-                    ws.append([k, v])
-                
-                for _, row in edited_df.iterrows():
-                    if row["Validează"]:
-                        ws.append([row["Termen Română"], row["Traducere Engleză (Editabil)"]])
-                
-                dict_buf = io.BytesIO()
-                updated_wb.save(dict_buf)
-                dict_buf.seek(0)
+            approved_dict = {}
+            for _, row in edited_df.iterrows():
+                if row["Validează"]:
+                    approved_dict[row["Termen Română"]] = row["Traducere Engleză (Editabil)"]
+            
+            if approved_dict:
+                with st.spinner("Se salvează termenii direct în dicționarul de pe GitHub..."):
+                    if update_github_dictionary(approved_dict):
+                        st.success(f"✅ {len(approved_dict)} termeni noi au fost salvați direct și permanent în dicționar!")
 
-                st.download_button(
-                    label="📥 Descarcă 'dictionar.xlsx' actualizat",
-                    data=dict_buf,
-                    file_name="dictionar.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+        buf = io.BytesIO()
+        st.session_state.translated_wb.save(buf)
+        buf.seek(0)
+
+        st.download_button(
+            label="📥 Descarcă Fișierul Excel Tradus (.xlsx)",
+            data=buf,
+            file_name=f"translated_{uploaded_file.name}",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
