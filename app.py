@@ -1,13 +1,13 @@
 import os
 import io
 import re
-import copy
 import unicodedata
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side
 from deep_translator import GoogleTranslator
+import copy
 
 st.set_page_config(page_title="Excel Mirror Translator", page_icon="📊", layout="wide")
 
@@ -49,14 +49,6 @@ def is_purely_numeric(val) -> bool:
     only_chars = bool(re.match(r'^[\s\d.,\-–%/:]+$', s))
     return (has_digit and only_chars) or (s == "-")
 
-def clone_cell_style(src_cell, dst_cell):
-    if src_cell.has_style:
-        dst_cell.font = copy.copy(src_cell.font)
-        dst_cell.fill = copy.copy(src_cell.fill)
-        dst_cell.border = copy.copy(src_cell.border)
-        dst_cell.alignment = copy.copy(src_cell.alignment)
-        dst_cell.number_format = copy.copy(src_cell.number_format)
-
 def translate_with_google(text: str) -> tuple[str, str]:
     try:
         translated = GoogleTranslator(source='ro', target='en').translate(text)
@@ -69,12 +61,10 @@ def translate_with_google(text: str) -> tuple[str, str]:
         return text, "NOT FOUND"
 
 def extract_pairs_from_sheet(sheet):
-    """Scanează inteligent orice foaie pentru a găsi perechile Română -> Engleză"""
     pairs = {}
     if sheet.max_row is None or sheet.max_row < 1:
         return pairs
 
-    # Identificăm coloana sursă și țintă
     src_col, trg_col = 1, 2
     header_found = False
 
@@ -89,8 +79,6 @@ def extract_pairs_from_sheet(sheet):
                 header_found = True
 
     start_row = 2 if header_found else 1
-
-    # Dacă sunt pe aceeași coloană din greșeală, punem coloanele implicite 1 și 2
     if src_col == trg_col:
         src_col, trg_col = 1, 2
 
@@ -98,7 +86,6 @@ def extract_pairs_from_sheet(sheet):
         src = sheet.cell(r, src_col).value
         trg = sheet.cell(r, trg_col).value
 
-        # Dacă coloana detectată e goală, căutăm primele două celule populate din rând
         if not src or not trg:
             non_empty = [c for c in range(1, min(10, sheet.max_column + 1)) if sheet.cell(r, c).value not in [None, ""]]
             if len(non_empty) >= 2:
@@ -120,90 +107,76 @@ def load_master_dictionary():
             dict_wb = load_workbook(DEFAULT_DICT_PATH, data_only=True)
             for sheet_name in dict_wb.sheetnames:
                 sheet = dict_wb[sheet_name]
-                extracted = extract_pairs_from_sheet(sheet)
-                dictionary.update(extracted)
+                dictionary.update(extract_pairs_from_sheet(sheet))
         except Exception:
             pass
     return dictionary
 
 def run_translation_pipeline(input_bytes, master_dict):
+    # Încărcăm fișierul original - pe el vom lucra direct pentru a păstra absolut toată formatarea
     wb = load_workbook(io.BytesIO(input_bytes), data_only=False)
     wb_vals = load_workbook(io.BytesIO(input_bytes), data_only=True)
 
     dictionary = dict(master_dict)
-    
-    # Verificăm dacă există și un dicționar integrat în fișierul de tradus
     for s in wb.sheetnames:
         if normalize_text(s) in ["dictionar", "dictionary", "glosar"]:
-            sheet = wb[s]
-            extracted = extract_pairs_from_sheet(sheet)
-            dictionary.update(extracted)
-
-    out_wb = Workbook()
-    out_wb.remove(out_wb.active)
+            dictionary.update(extract_pairs_from_sheet(wb[s]))
 
     review_rows = []
     stats = {"MATCH": 0, "MISSING": 0, "NOT FOUND": 0, "SKIP": 0}
     unique_new_terms = {}
 
-    for sheet_name in wb.sheetnames:
+    source_sheets = [s for s in wb.sheetnames]
+
+    for sheet_name in source_sheets:
         src_sheet = wb[sheet_name]
         val_sheet = wb_vals[sheet_name]
         s_norm = normalize_text(sheet_name)
 
+        # Ignorăm dicționarele și foile deja traduse (marcate cu _)
         if s_norm in ["dictionar", "dictionary", "glosar"] or sheet_name.startswith('_'):
-            new_s = out_wb.create_sheet(title=sheet_name[:31])
-            for r in range(1, src_sheet.max_row + 1):
-                for c in range(1, src_sheet.max_column + 1):
-                    cell = src_sheet.cell(r, c)
-                    dst = new_s.cell(r, c, cell.value)
-                    clone_cell_style(cell, dst)
             continue
 
-        orig_twin = out_wb.create_sheet(title=sheet_name[:31])
-        for r in range(1, src_sheet.max_row + 1):
-            for c in range(1, src_sheet.max_column + 1):
-                cell = src_sheet.cell(r, c)
-                dst = orig_twin.cell(r, c, cell.value)
-                clone_cell_style(cell, dst)
-
+        # 1. Clonare Nativă a Foii - Păstrează 100% formatarea, inclusiv zone de print, freeze panes etc.
+        tr_twin = wb.copy_worksheet(src_sheet)
         tr_title = f"{sheet_name[:25]} (EN)"[:31]
-        tr_twin = out_wb.create_sheet(title=tr_title)
+        tr_twin.title = tr_title
 
-        for col_letter, col_dim in src_sheet.column_dimensions.items():
-            tr_twin.column_dimensions[col_letter].width = col_dim.width
-        for row_idx, row_dim in src_sheet.row_dimensions.items():
-            tr_twin.row_dimensions[row_idx].height = row_dim.height
-        for m_range in src_sheet.merged_cells.ranges:
-            tr_twin.merge_cells(str(m_range))
+        # Mutăm foaia geamănă imediat după foaia originală
+        target_idx = wb.index(src_sheet) + 1
+        current_idx = wb.index(tr_twin)
+        wb.move_sheet(tr_twin, offset=target_idx - current_idx)
 
+        # Calculăm care celule fac parte din "merged ranges" dar nu sunt celula principală
         merged_non_anchors = set()
-        for rng in src_sheet.merged_cells.ranges:
+        for rng in tr_twin.merged_cells.ranges:
             for r in range(rng.min_row, rng.max_row + 1):
                 for c in range(rng.min_col, rng.max_col + 1):
                     if not (r == rng.min_row and c == rng.min_col):
                         merged_non_anchors.add((r, c))
 
-        for r in range(1, src_sheet.max_row + 1):
-            for c in range(1, src_sheet.max_column + 1):
-                src_c = src_sheet.cell(r, c)
-                val_c = val_sheet.cell(r, c)
-                dst_c = tr_twin.cell(r, c)
-                clone_cell_style(src_c, dst_c)
-
+        # 2. Traducerea valorilor în foaia clonată
+        for r in range(1, tr_twin.max_row + 1):
+            for c in range(1, tr_twin.max_column + 1):
                 if (r, c) in merged_non_anchors:
                     stats["SKIP"] += 1
                     continue
 
-                val = val_c.value
+                dst_c = tr_twin.cell(r, c)
+                val = val_sheet.cell(r, c).value
+                
+                # Dacă e o formulă, copiem valoarea calculată în locul formulei (ca să nu dea eroare în engleză)
+                if dst_c.data_type == 'f':
+                    dst_c.value = val
+
                 if val is None or str(val).strip() == "" or is_purely_numeric(val):
-                    dst_c.value = src_c.value
                     stats["SKIP"] += 1
                     continue
 
                 val_str = str(val).strip()
                 val_norm = normalize_text(val_str)
 
+                # Prioritate Dicționar
                 if val_norm in dictionary:
                     dst_c.value = dictionary[val_norm]
                     stats["MATCH"] += 1
@@ -220,7 +193,8 @@ def run_translation_pipeline(input_bytes, master_dict):
                         dst_c.border = BORDER_NOT_FOUND
                         review_rows.append((tr_title, r, c, val_str, tr_text, "NOT FOUND"))
 
-    summary = out_wb.create_sheet(title="_Review Summary", index=0)
+    # Tab _Review Summary
+    summary = wb.create_sheet(title="_Review Summary", index=0)
     summary.append(["Sheet", "Row", "Column", "Original", "Translation", "Status"])
     for col_idx in range(1, 7):
         c = summary.cell(1, col_idx)
@@ -233,7 +207,7 @@ def run_translation_pipeline(input_bytes, master_dict):
         color = "FF0000" if row_data[5] == "NOT FOUND" else "FFC000"
         status_cell.fill = PatternFill(start_color=color, fill_type="solid")
 
-    return out_wb, stats, unique_new_terms
+    return wb, stats, unique_new_terms
 
 # --- UI Streamlit ---
 st.title("📊 Excel Mirror Translator (Dicționar Încorporat)")
