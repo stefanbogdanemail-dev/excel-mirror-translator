@@ -1,3 +1,5 @@
 streamlit
 openpyxl
 deep-translator
+PyGithub
+pandas
